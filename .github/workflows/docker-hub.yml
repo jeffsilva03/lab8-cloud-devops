@@ -1,5 +1,5 @@
 
-name: CI/CD - FastAPI Docker Hub
+name: CI/CD - FastAPI Docker Hub e AWS EC2
 
 on:
   push:
@@ -8,6 +8,10 @@ on:
     branches: [main]
 
 jobs:
+
+  # ==========================================
+  # JOB 1 - Testes automatizados
+  # ==========================================
   Build:
     name: Compilar e Testar Projeto
     runs-on: ubuntu-latest
@@ -24,13 +28,16 @@ jobs:
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest httpx
+          python -m pip install -r requirements.txt
+          python -m pip install pytest httpx
 
       - name: Executar testes
         run: |
           PYTHONPATH=. python -m pytest tests/ -v --tb=short
 
+  # ==========================================
+  # JOB 2 - Publicar imagem no Docker Hub
+  # ==========================================
   Imagem:
     name: Publicar Imagem Docker
     runs-on: ubuntu-latest
@@ -59,7 +66,9 @@ jobs:
             jeffsilva03/lab8-fastapi:latest
             jeffsilva03/lab8-fastapi:${{ github.sha }}
 
-
+  # ==========================================
+  # JOB 3 - Deploy automatico na AWS EC2
+  # ==========================================
   Deploy:
     name: Deploy AWS EC2
     runs-on: ubuntu-latest
@@ -67,32 +76,69 @@ jobs:
     if: github.event_name == 'push'
 
     steps:
+      - name: Configurar SSH seguro
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          ssh-keyscan -T 15 -t ed25519 "$EC2_HOST" > ~/.ssh/known_hosts
+
+          ACTUAL=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          EXPECTED="SHA256:4ZrT7Jh+h4KkZgodHTtdWgGH7TxgmrIN+Yu8bHH38W0"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERRO: Fingerprint SSH nao corresponde."
+            exit 1
+          fi
+
+          chmod 600 ~/.ssh/known_hosts
+          echo "Identidade SSH validada."
+
       - name: Atualizar aplicacao na EC2
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          fingerprint: SHA256:qzczKyEds+1S+BigCE8IhkO6FsyTlM0Kzd+KODHHZZo
-          script: |
-            set -e
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=20 \
+            "$EC2_USERNAME@$EC2_HOST" 'bash -se' <<'REMOTE'
+          set -e
 
-            echo "Baixando nova imagem..."
-            sudo docker pull jeffsilva03/lab8-fastapi:${{ github.sha }}
+          echo "Baixando imagem Docker..."
+          sudo docker pull jeffsilva03/lab8-fastapi:${{ github.sha }}
 
-            echo "Parando container anterior..."
-            sudo docker stop lab8-fastapi || true
-            sudo docker rm lab8-fastapi || true
+          echo "Parando container anterior..."
+          sudo docker stop lab8-fastapi 2>/dev/null || true
+          sudo docker rm lab8-fastapi 2>/dev/null || true
 
-            echo "Iniciando novo container..."
-            sudo docker run -d \
-              --name lab8-fastapi \
-              --restart unless-stopped \
-              -p 8080:8080 \
-              jeffsilva03/lab8-fastapi:${{ github.sha }}
+          echo "Iniciando nova versao..."
+          sudo docker run -d \
+            --name lab8-fastapi \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            jeffsilva03/lab8-fastapi:${{ github.sha }}
 
-            echo "Verificando API..."
-            sleep 5
-            curl --fail http://localhost:8080/health
+          echo "Executando health check..."
+          for i in $(seq 1 12); do
+            if curl --fail --silent http://localhost:8080/health; then
+              echo ""
+              echo "Deploy concluido com sucesso!"
+              exit 0
+            fi
+            sleep 2
+          done
 
-            echo "Deploy concluido!"
+          echo "ERRO: API nao respondeu ao health check."
+          sudo docker logs --tail 30 lab8-fastapi
+          exit 1
+          REMOTE
