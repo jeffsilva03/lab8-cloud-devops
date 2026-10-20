@@ -58,3 +58,41 @@ jobs:
           tags: |
             jeffsilva03/lab8-fastapi:latest
             jeffsilva03/lab8-fastapi:${{ github.sha }}
+
+
+  Deploy:
+    name: Deploy AWS EC2
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Atualizar aplicacao na EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: SHA256:4ZrT7Jh+h4KkZgodHTtdWgGH7TxgmrIN+Yu8bHH38W0
+          script: |
+            set -e
+
+            echo "Baixando nova imagem..."
+            sudo docker pull jeffsilva03/lab8-fastapi:${{ github.sha }}
+
+            echo "Parando container anterior..."
+            sudo docker stop lab8-fastapi || true
+            sudo docker rm lab8-fastapi || true
+
+            echo "Iniciando novo container..."
+            sudo docker run -d \
+              --name lab8-fastapi \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              jeffsilva03/lab8-fastapi:${{ github.sha }}
+
+            echo "Verificando API..."
+            sleep 5
+            curl --fail http://localhost:8080/health
+
+            echo "Deploy concluido!"
