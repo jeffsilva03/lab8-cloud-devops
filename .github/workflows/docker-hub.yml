@@ -1,17 +1,19 @@
 
-name: CI/CD - FastAPI Docker Hub e AWS EC2
+name: CI/CD - Homologacao e Producao
 
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
   pull_request:
-    branches: [main]
+    branches: [develop, main]
+
+env:
+  IMAGE_NAME: jeffsilva03/lab8-fastapi
+  CONTAINER_PORT: 8080
 
 jobs:
 
-  # ==========================================
-  # JOB 1 - Testes automatizados
-  # ==========================================
+  # JOB 1 - Build e testes
   Build:
     name: Compilar e Testar Projeto
     runs-on: ubuntu-latest
@@ -35,9 +37,7 @@ jobs:
         run: |
           PYTHONPATH=. python -m pytest tests/ -v --tb=short
 
-  # ==========================================
-  # JOB 2 - Publicar imagem no Docker Hub
-  # ==========================================
+  # JOB 2 - Imagem Docker
   Imagem:
     name: Publicar Imagem Docker
     runs-on: ubuntu-latest
@@ -51,35 +51,38 @@ jobs:
       - name: Configurar Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login no Docker Hub
+      - name: Login Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build e Push da imagem
+      - name: Build e Push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            jeffsilva03/lab8-fastapi:latest
-            jeffsilva03/lab8-fastapi:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-  # ==========================================
-  # JOB 3 - Deploy automatico na AWS EC2
-  # ==========================================
-  Deploy:
-    name: Deploy AWS EC2
+  # JOB 3 - Homologacao
+  Deploy_Homologacao:
+    name: Deploy Homologacao
     runs-on: ubuntu-latest
     needs: Imagem
-    if: github.event_name == 'push'
+
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+
+    environment: homologacao
 
     steps:
-      - name: Configurar SSH seguro
+      - name: Configurar SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST_FINGERPRINT: ${{ secrets.EC2_HOST_FINGERPRINT }}
         run: |
           set -euo pipefail
 
@@ -92,17 +95,15 @@ jobs:
           ssh-keyscan -T 15 -t ed25519 "$EC2_HOST" > ~/.ssh/known_hosts
 
           ACTUAL=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
-          EXPECTED="SHA256:4ZrT7Jh+h4KkZgodHTtdWgGH7TxgmrIN+Yu8bHH38W0"
 
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERRO: Fingerprint SSH nao corresponde."
+          if [ "$ACTUAL" != "$EC2_HOST_FINGERPRINT" ]; then
+            echo "ERRO: Fingerprint SSH invalido"
             exit 1
           fi
 
           chmod 600 ~/.ssh/known_hosts
-          echo "Identidade SSH validada."
 
-      - name: Atualizar aplicacao na EC2
+      - name: Deploy na EC2 de Homologacao
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
@@ -110,35 +111,100 @@ jobs:
           ssh -i ~/.ssh/ec2_key \
             -o StrictHostKeyChecking=yes \
             -o BatchMode=yes \
-            -o ConnectTimeout=20 \
             "$EC2_USERNAME@$EC2_HOST" 'bash -se' <<'REMOTE'
           set -e
 
-          echo "Baixando imagem Docker..."
-          sudo docker pull jeffsilva03/lab8-fastapi:${{ github.sha }}
+          sudo docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-          echo "Parando container anterior..."
-          sudo docker stop lab8-fastapi 2>/dev/null || true
-          sudo docker rm lab8-fastapi 2>/dev/null || true
+          sudo docker stop lab8-homologacao 2>/dev/null || true
+          sudo docker rm lab8-homologacao 2>/dev/null || true
 
-          echo "Iniciando nova versao..."
           sudo docker run -d \
-            --name lab8-fastapi \
+            --name lab8-homologacao \
             --restart unless-stopped \
-            -p 8080:8080 \
-            jeffsilva03/lab8-fastapi:${{ github.sha }}
+            -p 8080:${{ env.CONTAINER_PORT }} \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-          echo "Executando health check..."
           for i in $(seq 1 12); do
             if curl --fail --silent http://localhost:8080/health; then
-              echo ""
-              echo "Deploy concluido com sucesso!"
+              echo "Homologacao OK"
               exit 0
             fi
             sleep 2
           done
 
-          echo "ERRO: API nao respondeu ao health check."
-          sudo docker logs --tail 30 lab8-fastapi
+          sudo docker logs --tail 30 lab8-homologacao
+          exit 1
+          REMOTE
+
+  # JOB 4 - Producao
+  Deploy_Producao:
+    name: Deploy Producao
+    runs-on: ubuntu-latest
+    needs: Imagem
+
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    environment: producao
+
+    steps:
+      - name: Configurar SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST_FINGERPRINT: ${{ secrets.EC2_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          ssh-keyscan -T 15 -t ed25519 "$EC2_HOST" > ~/.ssh/known_hosts
+
+          ACTUAL=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+
+          if [ "$ACTUAL" != "$EC2_HOST_FINGERPRINT" ]; then
+            echo "ERRO: Fingerprint SSH invalido"
+            exit 1
+          fi
+
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy na EC2 de Producao
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            "$EC2_USERNAME@$EC2_HOST" 'bash -se' <<'REMOTE'
+          set -e
+
+          sudo docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+          sudo docker stop lab8-producao 2>/dev/null || true
+          sudo docker rm lab8-producao 2>/dev/null || true
+
+          sudo docker run -d \
+            --name lab8-producao \
+            --restart unless-stopped \
+            -p 8080:${{ env.CONTAINER_PORT }} \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+          for i in $(seq 1 12); do
+            if curl --fail --silent http://localhost:8080/health; then
+              echo "Producao OK"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          sudo docker logs --tail 30 lab8-producao
           exit 1
           REMOTE
